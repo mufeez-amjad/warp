@@ -38,9 +38,9 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process;
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
 #[cfg(target_os = "macos")]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime};
 
 use ::settings::{Setting, ToggleableSetting};
 use ai::index::full_source_code_embedding::manager::CodebaseIndexManager;
@@ -52,6 +52,7 @@ use autoupdate::AutoupdateStage;
 #[cfg(target_os = "macos")]
 use command::blocking::Command;
 use futures::Future;
+use futures_util::stream::AbortHandle;
 use instant::Instant;
 use itertools::Itertools;
 use lazy_static::lazy_static;
@@ -87,6 +88,7 @@ use warp_util::path::{LineAndColumnArg, user_friendly_path};
 use warpui::accessibility::{
     AccessibilityContent, AccessibilityVerbosity, ActionAccessibilityContent, WarpA11yRole,
 };
+use warpui::r#async::Timer;
 use warpui::clipboard::ClipboardContent;
 #[cfg(target_family = "wasm")]
 use warpui::elements::Percentage;
@@ -1190,6 +1192,7 @@ pub struct Workspace {
     left_panel_open: bool,
     vertical_tabs_panel_open: bool,
     vertical_tabs_panel: VerticalTabsPanelState,
+    inactive_tabs_refresh: Option<AbortHandle>,
     left_panel_view: ViewHandle<LeftPanelView>,
     left_panel_views: Vec<ToolPanelView>,
     right_panel_view: ViewHandle<RightPanelView>,
@@ -3528,6 +3531,7 @@ impl Workspace {
             left_panel_open: false,
             vertical_tabs_panel_open: false,
             vertical_tabs_panel: Default::default(),
+            inactive_tabs_refresh: None,
             left_panel_view,
             left_panel_views,
             right_panel_view,
@@ -5572,6 +5576,43 @@ impl Workspace {
         }
     }
 
+    fn refresh_inactive_tabs_state(&mut self, ctx: &mut ViewContext<Self>) {
+        if let Some(abort_handle) = self.inactive_tabs_refresh.take() {
+            abort_handle.abort();
+        }
+
+        let now = SystemTime::now();
+        if !self.tabs.iter().any(|tab| tab.is_inactive(now)) {
+            self.vertical_tabs_panel.inactive_tabs_expanded = false;
+        }
+        self.vertical_tabs_panel
+            .expanded_inactive_tab_groups
+            .retain(|group_id| {
+                self.tabs
+                    .iter()
+                    .any(|tab| tab.group_id == Some(*group_id) && tab.is_inactive(now))
+            });
+
+        let next_transition = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.next_inactive_transition(now))
+            .min();
+        if let Some(delay) = next_transition {
+            let task = ctx.spawn(
+                async move {
+                    Timer::after(delay).await;
+                },
+                |me, _, ctx| {
+                    me.inactive_tabs_refresh = None;
+                    me.refresh_inactive_tabs_state(ctx);
+                    ctx.notify();
+                },
+            );
+            self.inactive_tabs_refresh = Some(task.abort_handle());
+        }
+    }
+
     /// Change the active tab index. This must be used instead of setting `self.active_tab_index`
     /// directly, as it updates related state.
     pub(crate) fn set_active_tab_index(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
@@ -5585,7 +5626,18 @@ impl Workspace {
             index
         };
 
+        let previous_index = self.active_tab_index;
+        if index != previous_index {
+            let now = SystemTime::now();
+            if let Some(previous_tab) = self.tabs.get_mut(previous_index) {
+                previous_tab.mark_inactive(now);
+            }
+            if let Some(selected_tab) = self.tabs.get_mut(index) {
+                selected_tab.mark_selected(now);
+            }
+        }
         self.active_tab_index = index;
+        self.refresh_inactive_tabs_state(ctx);
 
         // The range selection's anchor is the active tab, so any change to
         // the active tab makes the existing selection stale; clear it.
@@ -16251,6 +16303,17 @@ impl Workspace {
                 self.update_active_session(ctx);
                 // ctx.notify();
             }
+            pane_group::Event::PromptSubmitted => {
+                if let Some(tab) = self
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.pane_group.id() == pane_group.id())
+                {
+                    tab.mark_prompt_submitted();
+                    self.refresh_inactive_tabs_state(ctx);
+                    ctx.notify();
+                }
+            }
             pane_group::Event::Escape => {
                 if self.current_workspace_state.is_resource_center_open {
                     self.current_workspace_state.is_resource_center_open = false;
@@ -24171,6 +24234,18 @@ impl TypedActionView for Workspace {
                 position,
             } => self.toggle_vertical_tabs_pane_context_menu(*tab_index, *target, *position, ctx),
             ToggleTabBarOverflowMenu => self.toggle_tab_bar_overflow_menu(ctx),
+            ToggleInactiveTabsExpanded(group_id) => {
+                if let Some(group_id) = group_id {
+                    let expanded = &mut self.vertical_tabs_panel.expanded_inactive_tab_groups;
+                    if !expanded.remove(group_id) {
+                        expanded.insert(*group_id);
+                    }
+                } else {
+                    self.vertical_tabs_panel.inactive_tabs_expanded =
+                        !self.vertical_tabs_panel.inactive_tabs_expanded;
+                }
+                ctx.notify();
+            }
             ToggleBlockSnackbar => self.toggle_block_snackbar(ctx),
             ToggleWelcomeTips => self.toggle_welcome_tips_visiblity(ctx),
             CloseTab(index) => self.close_tab(*index, false, true, ctx),

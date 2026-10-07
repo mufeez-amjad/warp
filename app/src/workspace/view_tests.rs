@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ai::index::full_source_code_embedding::manager::CodebaseIndexManager;
@@ -4426,6 +4426,117 @@ fn test_tab_mru_order() {
             workspace.handle_action(&WorkspaceAction::ActivateTab(0), ctx);
 
             assert_eq!(workspace.tab_mru_order(), &[id_a, id_c, id_b]);
+        });
+    });
+}
+
+#[test]
+fn test_inactive_workspace_tab_requires_prompt_to_graduate() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            let now = SystemTime::now();
+            workspace.tabs[0].set_inactive_since(Some(
+                now - crate::tab::INACTIVE_TAB_THRESHOLD - Duration::from_secs(1),
+            ));
+
+            workspace.activate_tab(0, ctx);
+            assert!(workspace.tabs[0].is_inactive(now));
+
+            let pane_group = workspace.tabs[0].pane_group.clone();
+            workspace.handle_file_tree_event(pane_group, &pane_group::Event::PromptSubmitted, ctx);
+            assert!(!workspace.tabs[0].is_inactive(now));
+
+            workspace.activate_tab(1, ctx);
+            workspace.activate_tab(0, ctx);
+            assert!(
+                workspace.tabs[1]
+                    .next_inactive_transition(SystemTime::now())
+                    .is_some()
+            );
+        });
+    });
+}
+
+#[test]
+fn test_inactive_sidebar_tabs_preserve_active_and_pinned_members() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            let now = SystemTime::now();
+            let stale_since = now - crate::tab::INACTIVE_TAB_THRESHOLD - Duration::from_secs(1);
+            let group_id = TabGroupId::new();
+            for tab in &mut workspace.tabs[..2] {
+                tab.group_id = Some(group_id);
+                tab.set_inactive_since(Some(stale_since));
+            }
+
+            assert_eq!(
+                vertical_tabs::collapsible_inactive_tab_indices(workspace, now),
+                HashSet::from([0, 1])
+            );
+
+            workspace.tabs[0].set_inactive_since(None);
+            assert_eq!(
+                vertical_tabs::collapsible_inactive_tab_indices(workspace, now),
+                HashSet::from([1]),
+                "a recent member must not prevent its inactive sibling from collapsing",
+            );
+            workspace.tabs[0].set_inactive_since(Some(stale_since));
+            workspace.tabs[0].pinned = true;
+            assert_eq!(
+                vertical_tabs::collapsible_inactive_tab_indices(workspace, now),
+                HashSet::from([1])
+            );
+
+            workspace.tabs[0].pinned = false;
+            workspace.activate_tab(0, ctx);
+            assert_eq!(
+                vertical_tabs::collapsible_inactive_tab_indices(workspace, now),
+                HashSet::from([1])
+            );
+        });
+    });
+}
+
+#[test]
+fn test_inactive_tab_group_disclosures_expand_independently() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            let first = TabGroupId::new();
+            let second = TabGroupId::new();
+            workspace.handle_action(
+                &WorkspaceAction::ToggleInactiveTabsExpanded(Some(first)),
+                ctx,
+            );
+            workspace.handle_action(
+                &WorkspaceAction::ToggleInactiveTabsExpanded(Some(second)),
+                ctx,
+            );
+            workspace.handle_action(
+                &WorkspaceAction::ToggleInactiveTabsExpanded(Some(first)),
+                ctx,
+            );
+            assert_eq!(
+                workspace.vertical_tabs_panel.expanded_inactive_tab_groups,
+                HashSet::from([second]),
+            );
+            assert!(!workspace.vertical_tabs_panel.inactive_tabs_expanded);
+            workspace.handle_action(&WorkspaceAction::ToggleInactiveTabsExpanded(None), ctx);
+            assert!(workspace.vertical_tabs_panel.inactive_tabs_expanded);
+            assert_eq!(
+                workspace.vertical_tabs_panel.expanded_inactive_tab_groups,
+                HashSet::from([second]),
+            );
         });
     });
 }

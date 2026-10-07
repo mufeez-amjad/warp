@@ -17,8 +17,8 @@ use warpui::{
 #[cfg(not(target_family = "wasm"))]
 use super::local_harness_launch::{PreparedLocalHarnessLaunch, prepare_local_harness_child_launch};
 use super::{
-    DetachType, PaneConfiguration, PaneContent, PaneId, PaneStackEvent, PaneView, ShareableLink,
-    ShareableLinkError, TerminalPaneId,
+    DetachType, PaneConfiguration, PaneContent, PaneId, PaneStack, PaneStackEvent, PaneView,
+    ShareableLink, ShareableLinkError, TerminalPaneId,
 };
 // Imports below are only consumed by the non-wasm `launch_local_*_child`
 // dispatch helpers; gating them keeps the wasm build warning-clean.
@@ -181,6 +181,15 @@ impl TerminalPane {
     /// The [`TerminalView`] backing the [`PaneView`] for this terminal pane.
     pub(crate) fn terminal_view(&self, ctx: &AppContext) -> ViewHandle<TerminalView> {
         self.view.as_ref(ctx).child(ctx)
+    }
+
+    /// The [`PaneStack`] backing this terminal pane. It holds one entry per
+    /// nested shell (tab) hosted inside the pane.
+    pub(in crate::pane_group) fn pane_stack(
+        &self,
+        ctx: &AppContext,
+    ) -> ModelHandle<PaneStack<TerminalView>> {
+        self.view.as_ref(ctx).pane_stack().clone()
     }
 
     /// The UUID that identifies this terminal session across app restarts.
@@ -875,8 +884,8 @@ fn attach_terminal_view(
 ) {
     ctx.subscribe_to_view(
         terminal_view,
-        move |group: &mut PaneGroup, _, event, ctx| {
-            handle_terminal_view_event(group, terminal_pane_id, event, ctx);
+        move |group: &mut PaneGroup, terminal_view, event, ctx| {
+            handle_terminal_view_event(group, terminal_pane_id, terminal_view.id(), event, ctx);
         },
     );
 }
@@ -895,6 +904,7 @@ fn handle_pane_stack_event(
         PaneStackEvent::ViewRemoved(terminal_view) => {
             ctx.unsubscribe_to_view(terminal_view);
         }
+        PaneStackEvent::ActiveChanged => {}
     }
 
     // Ensure we use the new top-level view's title and active session status.
@@ -907,6 +917,7 @@ fn handle_pane_stack_event(
 fn handle_terminal_view_event(
     group: &mut PaneGroup,
     terminal_pane_id: TerminalPaneId,
+    terminal_view_id: EntityId,
     event: &Event,
     ctx: &mut ViewContext<PaneGroup>,
 ) {
@@ -915,6 +926,7 @@ fn handle_terminal_view_event(
     if group.pane_contents.contains_key(&pane_id) {
         match event {
             Event::Escape => ctx.emit(pane_group::Event::Escape),
+            Event::PromptSubmitted => ctx.emit(pane_group::Event::PromptSubmitted),
             Event::ExecuteCommand(event) => {
                 ctx.emit(pane_group::Event::ExecuteCommand(event.clone()));
             }
@@ -923,19 +935,19 @@ fn handle_terminal_view_event(
                 // keep the pane open.  There might be useful information visible
                 // in the output, and if this was the first shell spawned when the
                 // user started the app, it will prevent it from suddenly quitting.
-                if group
-                    .terminal_view_from_pane_id(terminal_pane_id, ctx)
+                if !group
+                    .terminal_view_by_id_in_pane(pane_id, terminal_view_id, ctx)
                     .is_some_and(|terminal_view| {
-                        !terminal_view.as_ref(ctx).is_login_shell_bootstrapped()
+                        terminal_view.as_ref(ctx).is_login_shell_bootstrapped()
                     })
                 {
                     return;
                 }
 
-                group.close_pane(pane_id, ctx);
+                group.close_terminal_tab_for_view(pane_id, terminal_view_id, false, ctx);
             }
             Event::CloseRequested => {
-                group.close_pane_with_confirmation(pane_id, ctx);
+                group.close_terminal_tab_for_view(pane_id, terminal_view_id, true, ctx);
             }
             Event::Pane(pane_event) => group.handle_pane_event(pane_id, pane_event, ctx),
             Event::BlockListCleared => {

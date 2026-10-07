@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use languages::language_by_local_filename;
 use pathfinder_color::ColorU;
@@ -730,6 +731,8 @@ pub(super) struct VerticalTabsPanelState {
     show_details_on_hover_mouse_state: MouseStateHandle,
     panel_right_click_mouse_state: MouseStateHandle,
     pub(super) show_settings_popup: bool,
+    pub(super) inactive_tabs_expanded: bool,
+    pub(super) expanded_inactive_tab_groups: HashSet<TabGroupId>,
 }
 
 impl Default for VerticalTabsPanelState {
@@ -768,6 +771,8 @@ impl Default for VerticalTabsPanelState {
             show_details_on_hover_mouse_state: Default::default(),
             panel_right_click_mouse_state: Default::default(),
             show_settings_popup: false,
+            inactive_tabs_expanded: false,
+            expanded_inactive_tab_groups: HashSet::new(),
         }
     }
 }
@@ -1196,6 +1201,8 @@ impl VerticalTabsPanelState {
         tabs.iter()
             .enumerate()
             .filter(|(tab_index, tab)| {
+                let display_granularity =
+                    grouped_tab_display_granularity(tab.group_id, display_granularity);
                 // A group-name match admits every member, regardless of its own text.
                 if tab_admitted_by_group_name(tab.group_id, &matched_groups) {
                     return true;
@@ -1763,6 +1770,74 @@ fn render_vertical_tabs_panel(
         .finish()
 }
 
+fn render_inactive_tabs_disclosure(
+    count: usize,
+    expanded: bool,
+    group_id: Option<TabGroupId>,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    let indicator = if expanded { "▾" } else { "▸" };
+    EventHandler::new(
+        Container::new(
+            Text::new_inline(
+                format!("{indicator} Inactive tabs ({count})"),
+                appearance.ui_font_family(),
+                12.,
+            )
+            .with_color(theme.sub_text_color(theme.background()).into())
+            .finish(),
+        )
+        .with_horizontal_padding(12.)
+        .with_vertical_padding(8.)
+        .finish(),
+    )
+    .on_left_mouse_down(move |ctx, _, _| {
+        ctx.dispatch_typed_action(WorkspaceAction::ToggleInactiveTabsExpanded(group_id));
+        DispatchEventResult::StopPropagation
+    })
+    .finish()
+}
+
+fn should_collapse_inactive_tabs(
+    state: &VerticalTabsPanelState,
+    workspace: &Workspace,
+    is_any_pane_dragging: bool,
+    app: &AppContext,
+) -> bool {
+    // Tab reordering uses adjacent underlying indices as geometric neighbors.
+    // Reveal all rows in their original order throughout any drag.
+    state.search_query.is_empty()
+        && !is_any_pane_dragging
+        && !workspace
+            .tabs
+            .iter()
+            .any(|tab| tab.draggable_state.is_dragging())
+        && !workspace
+            .tab_groups
+            .values()
+            .any(|group| group.draggable_state.is_dragging())
+        && CrossWindowTabDrag::as_ref(app)
+            .ghost_state_for_window(workspace.window_id)
+            .is_none()
+}
+
+pub(super) fn collapsible_inactive_tab_indices(
+    workspace: &Workspace,
+    now: SystemTime,
+) -> HashSet<usize> {
+    workspace
+        .tabs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, tab)| {
+            (!tab.pinned && index != workspace.active_tab_index && tab.is_inactive(now))
+                .then_some(index)
+        })
+        .collect()
+}
+
 fn render_groups(
     state: &VerticalTabsPanelState,
     workspace: &Workspace,
@@ -1788,9 +1863,8 @@ fn render_groups(
             VerticalTabsDisplayGranularity::Tabs
         }
     };
-    let uses_outer_group_container = uses_outer_group_container(display_granularity);
     let query = state.search_query.as_str();
-    let visible_tabs: Vec<(usize, Option<Vec<PaneId>>)> = if query.is_empty() {
+    let mut visible_tabs: Vec<(usize, Option<Vec<PaneId>>)> = if query.is_empty() {
         workspace
             .tabs
             .iter()
@@ -1804,6 +1878,9 @@ fn render_groups(
             .iter()
             .enumerate()
             .filter_map(|(tab_index, tab)| {
+                let display_granularity =
+                    grouped_tab_display_granularity(tab.group_id, display_granularity);
+                let uses_outer_group_container = uses_outer_group_container(display_granularity);
                 let pane_group = tab.pane_group.as_ref(app);
                 let visible_pane_ids = pane_group.visible_pane_ids();
                 match resolved_mode {
@@ -1932,13 +2009,28 @@ fn render_groups(
     }
 
     let is_any_pane_dragging = any_workspace_pane_being_dragged(workspace, app);
+    let inactive_tab_indices =
+        if should_collapse_inactive_tabs(state, workspace, is_any_pane_dragging, app) {
+            collapsible_inactive_tab_indices(workspace, SystemTime::now())
+        } else {
+            HashSet::new()
+        };
+    let inactive_tab_count = inactive_tab_indices
+        .iter()
+        .filter(|&&index| workspace.tabs[index].group_id.is_none())
+        .count();
+    if !state.inactive_tabs_expanded {
+        visible_tabs.retain(|(index, _)| {
+            workspace.tabs[*index].group_id.is_some() || !inactive_tab_indices.contains(index)
+        });
+    }
     // Ghost state for cross-window drag hovering over this window's vertical tabs panel.
     let ghost_state = CrossWindowTabDrag::as_ref(app).ghost_state_for_window(workspace.window_id);
     let ghost_insertion_index = ghost_state.as_ref().map(|g| g.insertion_index);
     let mut groups = Flex::column()
         .with_main_axis_size(MainAxisSize::Min)
         .with_cross_axis_alignment(CrossAxisAlignment::Stretch);
-    if !uses_outer_group_container {
+    if !uses_outer_group_container(display_granularity) {
         groups = groups.with_spacing(TABS_MODE_ITEM_SPACING);
     }
 
@@ -1981,8 +2073,12 @@ fn render_groups(
                     workspace,
                     &group,
                     members,
-                    last_member_after_index,
-                    is_any_pane_dragging,
+                    &inactive_tab_indices,
+                    TabGroupDragState {
+                        is_any_pane_dragging,
+                        insert_before_index: tab_index,
+                        insert_after_index: last_member_after_index,
+                    },
                     app,
                 ));
                 i += run_len;
@@ -2010,6 +2106,14 @@ fn render_groups(
                 i += 1;
             }
         }
+    }
+    if inactive_tab_count > 0 {
+        groups.add_child(render_inactive_tabs_disclosure(
+            inactive_tab_count,
+            state.inactive_tabs_expanded,
+            None,
+            app,
+        ));
     }
     // Ghost after all tab groups (fencepost).
     if ghost_insertion_index == Some(workspace.tabs.len()) {
@@ -2048,7 +2152,7 @@ fn render_groups(
         .retain(|id, _| all_pane_ids.contains(id));
 
     let groups = groups.finish();
-    if uses_outer_group_container {
+    if uses_outer_group_container(display_granularity) {
         groups
     } else {
         Container::new(groups)
@@ -2105,6 +2209,7 @@ fn render_tab_group_internal(
             VerticalTabsDisplayGranularity::Tabs
         }
     };
+    let display_granularity = grouped_tab_display_granularity(tab.group_id, display_granularity);
     // Tabs inside a group skip the per-tab outer container; the group provides it.
     let uses_outer_group_container =
         !in_tab_group && uses_outer_group_container(display_granularity);
@@ -2172,19 +2277,10 @@ fn render_tab_group_internal(
     let is_being_renamed = is_active && workspace.current_workspace_state.is_tab_being_renamed();
     let rename_editor = workspace.tab_rename_editor.clone();
     let has_custom_title = pane_group.custom_title(app).is_some();
-    // In Panes view, tabs inside a group render individual pane rows, so each
-    // pane keeps its own generated title. Propagating the tab's custom title as
-    // an override here would shadow every pane's title with the same string.
-    // In Tabs/Summary modes there is only one row per tab, so the tab-level
-    // custom title is still the right thing to show.
-    let displayed_tab_title_override =
-        if in_tab_group && matches!(display_granularity, VerticalTabsDisplayGranularity::Panes) {
-            None
-        } else {
-            (!uses_outer_group_container)
-                .then(|| pane_group.custom_title(app))
-                .flatten()
-        };
+    // A grouped tab has one row, so preserve its custom title in every display mode.
+    let displayed_tab_title_override = (!uses_outer_group_container)
+        .then(|| pane_group.custom_title(app))
+        .flatten();
     let is_menu_open_for_tab = workspace
         .show_tab_right_click_menu
         .is_some_and(|(idx, _)| idx == tab_index);
@@ -2997,8 +3093,8 @@ fn render_grouped_tab_container(
     workspace: &Workspace,
     group: &TabGroup,
     members: &[(usize, Option<Vec<PaneId>>)],
-    last_member_after_index: Option<usize>,
-    is_any_pane_dragging: bool,
+    inactive_tab_indices: &HashSet<usize>,
+    drag_state: TabGroupDragState,
     app: &AppContext,
 ) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(app);
@@ -3018,7 +3114,11 @@ fn render_grouped_tab_container(
         .iter()
         .any(|(tab_index, _)| *tab_index == workspace.active_tab_index);
     let is_collapsed = group.collapsed;
-    let first_member_index = members.first().map(|(index, _)| *index).unwrap_or(0);
+    let TabGroupDragState {
+        is_any_pane_dragging,
+        insert_before_index: first_member_index,
+        insert_after_index: last_member_after_index,
+    } = drag_state;
 
     let resolved_mode = resolve_vertical_tabs_mode(app);
     let needs_outer_horizontal_padding = uses_outer_group_container(match resolved_mode {
@@ -3026,20 +3126,16 @@ fn render_grouped_tab_container(
         _ => VerticalTabsDisplayGranularity::Tabs,
     });
 
-    // GroupedTabs: zero inter-tab gap in Panes mode (each tab already has
-    // its own wrapper). Other modes keep `TABS_MODE_ITEM_SPACING`.
-    let member_tab_spacing = if FeatureFlag::GroupedTabs.is_enabled()
-        && matches!(resolved_mode, VerticalTabsResolvedMode::Panes)
-    {
-        0.
-    } else {
-        TABS_MODE_ITEM_SPACING
-    };
+    let inactive_count = members
+        .iter()
+        .filter(|(index, _)| inactive_tab_indices.contains(index))
+        .count();
+    let inactive_expanded = state.expanded_inactive_tab_groups.contains(&group_id);
     let container = Hoverable::new(mouse_states.container.clone(), |hover_state| {
         let mut content = Flex::column()
             .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-            .with_spacing(member_tab_spacing);
+            .with_spacing(TABS_MODE_ITEM_SPACING);
 
         // Collapsed group + active member: highlight the header instead of the (now hidden) member row.
         let is_header_selected = is_collapsed && any_member_active;
@@ -3099,7 +3195,33 @@ fn render_grouped_tab_container(
         // Collapsed groups hide member rows in the panel chrome; the members remain in `workspace.tabs`.
         if !is_collapsed {
             let last_member_idx = members.len().saturating_sub(1);
-            for (i, (tab_index, filtered_pane_ids)) in members.iter().enumerate() {
+            // Keep inactive members beneath their disclosure without changing tab order.
+            let ordered_members = members
+                .iter()
+                .enumerate()
+                .filter(|(_, (index, _))| !inactive_tab_indices.contains(index))
+                .chain(
+                    members
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (index, _))| inactive_tab_indices.contains(index)),
+                );
+            let mut rendered_disclosure = false;
+            for (i, (tab_index, filtered_pane_ids)) in ordered_members {
+                if inactive_tab_indices.contains(tab_index) {
+                    if !rendered_disclosure {
+                        content.add_child(render_inactive_tabs_disclosure(
+                            inactive_count,
+                            inactive_expanded,
+                            Some(group_id),
+                            app,
+                        ));
+                        rendered_disclosure = true;
+                    }
+                    if !inactive_expanded {
+                        continue;
+                    }
+                }
                 let tab = &workspace.tabs[*tab_index];
                 let insert_after_index = if i == last_member_idx {
                     last_member_after_index
@@ -4052,6 +4174,17 @@ fn pane_matches_query(props: &PaneProps<'_>, query_lower: &str, app: &AppContext
     search_fragments_contain_query(&props.rendered_search_text_fragments(app), query_lower)
 }
 
+fn grouped_tab_display_granularity(
+    group_id: Option<TabGroupId>,
+    display_granularity: VerticalTabsDisplayGranularity,
+) -> VerticalTabsDisplayGranularity {
+    if group_id.is_some() {
+        VerticalTabsDisplayGranularity::Tabs
+    } else {
+        display_granularity
+    }
+}
+
 fn uses_outer_group_container(display_granularity: VerticalTabsDisplayGranularity) -> bool {
     matches!(display_granularity, VerticalTabsDisplayGranularity::Panes)
 }
@@ -4541,6 +4674,21 @@ fn cloud_agent_working_directory_and_env(
     }
 }
 
+fn terminal_directory_title(terminal_view: &TerminalView, app: &AppContext) -> String {
+    let directory = terminal_view
+        .display_working_directory(app)
+        .filter(|directory| !directory.trim().is_empty())
+        .map(|directory| {
+            Path::new(&directory)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or(directory)
+        });
+    cloud_agent_working_directory_and_env(terminal_view, directory.as_deref(), app)
+        .or(directory)
+        .unwrap_or_else(|| terminal_view.terminal_title_from_shell())
+}
+
 fn render_terminal_row_content(
     props: &PaneProps<'_>,
     terminal_view: &TerminalView,
@@ -4597,7 +4745,7 @@ fn render_terminal_row_content(
                 props,
                 || {
                     render_text_line(
-                        &working_directory,
+                        &terminal_directory_title(terminal_view, app),
                         main_text_color,
                         ClipConfig::start(),
                         appearance,
@@ -7419,12 +7567,14 @@ fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn El
                         main_text_color,
                         app,
                     ),
-                    VerticalTabsPrimaryInfo::WorkingDirectory => {
-                        Text::new_inline(working_directory_text.clone(), font_family, 12.)
-                            .with_clip(ClipConfig::start())
-                            .with_color(main_text_color.into())
-                            .finish()
-                    }
+                    VerticalTabsPrimaryInfo::WorkingDirectory => Text::new_inline(
+                        terminal_directory_title(terminal_view, app),
+                        font_family,
+                        12.,
+                    )
+                    .with_clip(ClipConfig::start())
+                    .with_color(main_text_color.into())
+                    .finish(),
                     VerticalTabsPrimaryInfo::Branch => match branch_display {
                         (branch_text, true) => {
                             render_git_branch_text(&branch_text, main_text_color, 12., appearance)

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
@@ -62,6 +62,7 @@ use crate::workspace::{
 
 pub const TAB_BAR_BORDER_HEIGHT: f32 = 1.0;
 pub(crate) const TAB_INDICATOR_HEIGHT: f32 = 14.0;
+pub const INACTIVE_TAB_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60);
 const TAB_SHORTCUT_HINT_REVEAL_DELAY: Duration = Duration::from_millis(750);
 
 /// Binding names for switching to tabs 1–8 (tab index 0–7), used to surface the
@@ -370,6 +371,9 @@ pub struct TabData {
     pub in_multi_selection: bool,
     /// True when this tab is pinned to the front of the tab list.
     pub pinned: bool,
+    /// When this tab most recently stopped being active. `None` means it is
+    /// recent, active, or has received new prompt activity.
+    inactive_since: Option<SystemTime>,
 }
 
 const TAB_COLOR_ICON_PATH: &str = "bundled/svg/ellipse.svg";
@@ -390,7 +394,46 @@ impl TabData {
             group_id: None,
             in_multi_selection: false,
             pinned: false,
+            inactive_since: None,
         }
+    }
+
+    pub fn is_inactive(&self, now: SystemTime) -> bool {
+        self.inactive_since
+            .and_then(|inactive_since| now.duration_since(inactive_since).ok())
+            .is_some_and(|elapsed| elapsed > INACTIVE_TAB_THRESHOLD)
+    }
+
+    pub fn next_inactive_transition(&self, now: SystemTime) -> Option<Duration> {
+        let elapsed = now.duration_since(self.inactive_since?).ok()?;
+        (elapsed <= INACTIVE_TAB_THRESHOLD).then(|| {
+            INACTIVE_TAB_THRESHOLD
+                .saturating_sub(elapsed)
+                .saturating_add(Duration::from_millis(1))
+        })
+    }
+
+    pub fn mark_inactive(&mut self, now: SystemTime) {
+        if self.inactive_since.is_none() {
+            self.inactive_since = Some(now);
+        }
+    }
+
+    /// Selecting a recent tab makes it recent again. A stale tab remains stale
+    /// until the user submits a command or prompt in it.
+    pub fn mark_selected(&mut self, now: SystemTime) {
+        if !self.is_inactive(now) {
+            self.inactive_since = None;
+        }
+    }
+
+    pub fn mark_prompt_submitted(&mut self) {
+        self.inactive_since = None;
+    }
+
+    #[cfg(test)]
+    pub fn set_inactive_since(&mut self, inactive_since: Option<SystemTime>) {
+        self.inactive_since = inactive_since;
     }
 
     /// The resolved tab color: manual selection takes priority over directory default.

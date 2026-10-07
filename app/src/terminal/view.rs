@@ -1781,6 +1781,8 @@ pub enum Event {
         size_update: SizeUpdate,
     },
     ExecuteCommand(ExecuteCommandEvent),
+    /// The user submitted a shell command or agent prompt in this terminal.
+    PromptSubmitted,
     BlockStarted {
         is_for_in_band_command: bool,
     },
@@ -5010,7 +5012,7 @@ impl TerminalView {
                 .pane_stack
                 .as_ref()
                 .and_then(|h| h.upgrade(ctx))
-                .filter(|stack| stack.as_ref(ctx).depth() > 1)
+                .filter(|stack| stack.as_ref(ctx).has_nav_entries())
             {
                 pane_stack.update(ctx, |stack, ctx| {
                     stack.pop(ctx);
@@ -5413,7 +5415,15 @@ impl TerminalView {
         event: &BlocklistAIControllerEvent,
         ctx: &mut ViewContext<Self>,
     ) {
-        if let BlocklistAIControllerEvent::SentRequest { model_id, .. } = event {
+        if let BlocklistAIControllerEvent::SentRequest {
+            contains_user_query,
+            model_id,
+            ..
+        } = event
+        {
+            if *contains_user_query {
+                ctx.emit(Event::PromptSubmitted);
+            }
             self.maybe_insert_aws_bedrock_login_banner(model_id, ctx);
         }
         if let BlocklistAIControllerEvent::ExecuteLocalHarnessCommand { command } = event {
@@ -22351,6 +22361,7 @@ impl TerminalView {
             InputEvent::PageUp => self.page_up(ctx),
             InputEvent::PageDown => self.page_down(ctx),
             InputEvent::ExecuteCommand(event) => {
+                ctx.emit(Event::PromptSubmitted);
                 self.update_scroll_position_locking(
                     ScrollPositionUpdate::AfterCommandExecutionStarted,
                     ctx,
@@ -22398,6 +22409,7 @@ impl TerminalView {
                 prompt,
                 attachments,
             } => {
+                ctx.emit(Event::PromptSubmitted);
                 ctx.emit(Event::SendAgentPrompt {
                     server_conversation_token: *server_conversation_token,
                     prompt: prompt.clone(),
@@ -22505,38 +22517,31 @@ impl TerminalView {
                 };
                 let initial_prompt = initial_prompt.clone();
 
-                match self.pane_stack.as_ref().and_then(|h| h.upgrade(ctx)) {
-                    Some(pane_stack) => {
-                        let should_pop = pane_stack.as_ref(ctx).depth() > 1;
-                        if should_pop {
-                            pane_stack.update(ctx, |stack, ctx| {
-                                stack.pop(ctx);
-                            });
-                        }
-
-                        let active_view = pane_stack.as_ref(ctx).active_view().clone();
-
-                        // If the active view is `self`, this cloud-mode terminal is the root of the
-                        // pane stack and has no parent terminal to host a local agent conversation.
-                        if active_view.id() == self.id() {
-                            log::warn!(
-                                "ExitCloudModeAndStartLocalAgent received but cloud-mode pane has no parent terminal"
-                            );
-                        } else {
-                            active_view.update(ctx, |view, ctx| {
-                                view.enter_agent_view_for_new_conversation(
-                                    initial_prompt,
-                                    origin,
-                                    ctx,
-                                );
-                            });
-                        }
+                if let Some(pane_stack) = self.pane_stack.as_ref().and_then(|h| h.upgrade(ctx)) {
+                    let should_pop = pane_stack.as_ref(ctx).has_nav_entries();
+                    if should_pop {
+                        pane_stack.update(ctx, |stack, ctx| {
+                            stack.pop(ctx);
+                        });
                     }
-                    _ => {
+
+                    let active_view = pane_stack.as_ref(ctx).active_view().clone();
+
+                    // If the active view is `self`, this cloud-mode terminal is the root of the
+                    // pane stack and has no parent terminal to host a local agent conversation.
+                    if active_view.id() == self.id() {
                         log::warn!(
-                            "ExitCloudModeAndStartLocalAgent received but no pane stack available; cannot start local agent without a parent terminal"
+                            "ExitCloudModeAndStartLocalAgent received but cloud-mode pane has no parent terminal"
                         );
+                    } else {
+                        active_view.update(ctx, |view, ctx| {
+                            view.enter_agent_view_for_new_conversation(initial_prompt, origin, ctx);
+                        });
                     }
+                } else {
+                    log::warn!(
+                        "ExitCloudModeAndStartLocalAgent received but no pane stack available; cannot start local agent without a parent terminal"
+                    );
                 }
 
                 ctx.notify();

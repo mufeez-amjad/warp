@@ -387,6 +387,7 @@ pub enum WorkspaceAction {
     ToggleVerticalTabsPanel,
     OpenVerticalTabsPanel,
     ToggleVerticalTabsSettingsPopup,
+    ToggleInactiveTabsExpanded(Option<TabGroupId>),
     SetVerticalTabsDisplayGranularity(VerticalTabsDisplayGranularity),
     SetVerticalTabsTabItemMode(VerticalTabsTabItemMode),
     SetVerticalTabsViewMode(VerticalTabsViewMode),
@@ -1086,6 +1087,7 @@ impl WorkspaceAction {
             | ToggleRightPanel
             | OpenCodeReviewPanel(..)
             | ToggleVerticalTabsSettingsPopup
+            | ToggleInactiveTabsExpanded(_)
             | SetVerticalTabsDisplayGranularity(_)
             | SetVerticalTabsTabItemMode(_)
             | SetVerticalTabsViewMode(_)

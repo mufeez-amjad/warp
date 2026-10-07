@@ -14,16 +14,16 @@ use super::{
     VerticalTabsSummaryPrimaryLabel, branch_label_display, coalesce_summary_branch_entries,
     code_detail_kind_label, compact_branch_subtitle_display, detail_sidecar_width_and_bounds,
     detail_target_for_hovered_row, group_display_name, group_name_highlight_indices,
-    matched_group_ids, merge_group_name_matches, non_terminal_search_text_fragments,
-    pane_ids_for_display_granularity, pane_search_text_fragments, preferred_agent_tab_titles,
-    push_normalized_unique_summary_label, search_fragments_contain_query,
-    select_summary_pane_kind_icons, should_keep_detail_sidecar_visible_for_mouse_position,
-    should_show_tab_group_header, shows_synced_inputs_indicator,
-    sort_summary_primary_labels_status_first, summary_overflow_count,
-    summary_search_text_fragments, tab_admitted_by_group_name, terminal_kind_badge_label,
-    terminal_primary_line_data, terminal_pull_request_badge_label, terminal_search_text_fragments,
-    terminal_title_fallback_font, uses_outer_group_container, visible_pane_ids_for_detail_target,
-    vtab_diff_stats_text,
+    grouped_tab_display_granularity, matched_group_ids, merge_group_name_matches,
+    non_terminal_search_text_fragments, pane_ids_for_display_granularity,
+    pane_search_text_fragments, preferred_agent_tab_titles, push_normalized_unique_summary_label,
+    search_fragments_contain_query, select_summary_pane_kind_icons,
+    should_keep_detail_sidecar_visible_for_mouse_position, should_show_tab_group_header,
+    shows_synced_inputs_indicator, sort_summary_primary_labels_status_first,
+    summary_overflow_count, summary_search_text_fragments, tab_admitted_by_group_name,
+    terminal_kind_badge_label, terminal_primary_line_data, terminal_pull_request_badge_label,
+    terminal_search_text_fragments, terminal_title_fallback_font, uses_outer_group_container,
+    visible_pane_ids_for_detail_target, vtab_diff_stats_text,
 };
 use crate::ai::agent::conversation::ConversationStatus;
 use crate::context_chips::display_chip::GitLineChanges;
@@ -1476,5 +1476,25 @@ fn group_name_highlights_match_untitled_fallback() {
     assert_eq!(
         group_name_highlight_indices(&group_display_name(&tab_group(None)), "group"),
         vec![4, 5, 6, 7, 8]
+    );
+}
+
+#[test]
+fn grouped_tabs_show_only_the_focused_pane_even_in_panes_mode() {
+    let first = pane_id();
+    let focused = pane_id();
+    let panes = [first, focused];
+    let granularity = grouped_tab_display_granularity(
+        Some(TabGroupId::new()),
+        VerticalTabsDisplayGranularity::Panes,
+    );
+    assert_eq!(
+        pane_ids_for_display_granularity(&panes, focused, granularity),
+        vec![focused],
+    );
+    let ungrouped = grouped_tab_display_granularity(None, VerticalTabsDisplayGranularity::Panes);
+    assert_eq!(
+        pane_ids_for_display_granularity(&panes, focused, ungrouped),
+        panes,
     );
 }

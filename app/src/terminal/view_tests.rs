@@ -10441,6 +10441,123 @@ fn copy_does_not_forward_when_alt_screen_has_warp_selection() {
 }
 
 #[test]
+fn pane_stack_supports_tab_switching_reordering_and_transfer() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+
+        let t0 = add_window_with_terminal(&mut app, None);
+        let t1 = add_window_with_terminal(&mut app, None);
+        let t2 = add_window_with_terminal(&mut app, None);
+        let t3 = add_window_with_terminal(&mut app, None);
+
+        let m0 = t0.read(&app, |view, _| view.model.clone());
+        let m1 = t1.read(&app, |view, _| view.model.clone());
+        let m2 = t2.read(&app, |view, _| view.model.clone());
+        let m3 = t3.read(&app, |view, _| view.model.clone());
+        let (v0, v1, v2, v3) = (t0.clone(), t1.clone(), t2.clone(), t3.clone());
+        let (v0b, v1b, v2b, v3b) = (t0.clone(), t1.clone(), t2.clone(), t3.clone());
+
+        let (pane_stack, target_stack) = app.update(move |ctx| {
+            let mgr0 = ctx.add_model(|_| {
+                let m: Box<dyn TerminalManager> = Box::new(TestTerminalManager {
+                    model: m0,
+                    _view: v0,
+                });
+                m
+            });
+            let mgr1 = ctx.add_model(|_| {
+                let m: Box<dyn TerminalManager> = Box::new(TestTerminalManager {
+                    model: m1,
+                    _view: v1,
+                });
+                m
+            });
+            let mgr2 = ctx.add_model(|_| {
+                let m: Box<dyn TerminalManager> = Box::new(TestTerminalManager {
+                    model: m2,
+                    _view: v2,
+                });
+                m
+            });
+            let mgr3 = ctx.add_model(|_| {
+                let m: Box<dyn TerminalManager> = Box::new(TestTerminalManager {
+                    model: m3,
+                    _view: v3,
+                });
+                m
+            });
+            let pane_stack = ctx.add_model(|ctx| PaneStack::new(mgr0, v0b, ctx));
+            pane_stack.update(ctx, |stack, ctx| {
+                stack.add_tab(mgr1, v1b, ctx);
+                stack.add_tab(mgr2, v2b, ctx);
+            });
+            let target_stack = ctx.add_model(|ctx| PaneStack::new(mgr3, v3b, ctx));
+            (pane_stack, target_stack)
+        });
+
+        pane_stack.read(&app, |stack, _| {
+            assert_eq!(stack.depth(), 3);
+            assert_eq!(stack.tab_count(), 3);
+            assert!(!stack.has_nav_entries());
+            assert_eq!(stack.active_index(), 2);
+            assert_eq!(stack.active_view().id(), t2.id());
+        });
+
+        let moved = pane_stack.update(&mut app, |stack, ctx| {
+            stack.move_tab_by_view_id(t0.id(), 2, ctx)
+        });
+        assert!(moved);
+        pane_stack.read(&app, |stack, _| {
+            let ids: Vec<_> = stack.views().map(|view| view.id()).collect();
+            assert_eq!(ids, vec![t1.id(), t2.id(), t0.id()]);
+            assert_eq!(stack.active_index(), 1);
+            assert_eq!(stack.active_view().id(), t2.id());
+        });
+
+        let no_op = pane_stack.update(&mut app, |stack, ctx| {
+            stack.move_tab_by_view_id(t2.id(), 1, ctx)
+        });
+        assert!(!no_op);
+
+        let transferred = pane_stack
+            .update(&mut app, |stack, ctx| stack.take_tab_for_move(t0.id(), ctx))
+            .expect("source stack should release a non-final pane tab");
+        target_stack.update(&mut app, |stack, ctx| {
+            stack.insert_tab(1, transferred.0, transferred.1, ctx);
+        });
+        pane_stack.read(&app, |stack, _| {
+            assert_eq!(stack.depth(), 2);
+            assert_eq!(stack.tab_count(), 2);
+            assert_eq!(stack.active_index(), 1);
+            assert_eq!(stack.active_view().id(), t2.id());
+        });
+        target_stack.read(&app, |stack, _| {
+            let ids: Vec<_> = stack.views().map(|view| view.id()).collect();
+            assert_eq!(ids, vec![t3.id(), t0.id()]);
+            assert_eq!(stack.active_view().id(), t0.id());
+        });
+        let transferred_owner = t0.read(&app, |view, app| {
+            view.pane_stack
+                .as_ref()
+                .and_then(|stack| stack.upgrade(app))
+                .map(|stack| stack.id())
+        });
+        assert_eq!(transferred_owner, Some(target_stack.id()));
+
+        let _ = pane_stack.update(&mut app, |stack, ctx| stack.remove_at(1, ctx));
+        pane_stack.read(&app, |stack, _| {
+            assert_eq!(stack.depth(), 1);
+            assert_eq!(stack.tab_count(), 1);
+            assert_eq!(stack.active_index(), 0);
+            assert_eq!(stack.active_view().id(), t1.id());
+        });
+
+        let none = pane_stack.update(&mut app, |stack, ctx| stack.take_tab_for_move(t1.id(), ctx));
+        assert!(none.is_none());
+    })
+}
+
+#[test]
 fn copy_does_not_forward_on_normal_screen() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
@@ -10840,4 +10957,69 @@ fn visible_bootstrap_block_leaves_focus_on_tab_group_rename_editor() {
             workspace.is_inline_rename_editor_focused(ctx)
         }));
     });
+}
+
+#[test]
+fn pane_stack_distinguishes_tabs_from_nav_pushes() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+
+        let t0 = add_window_with_terminal(&mut app, None);
+        let t1 = add_window_with_terminal(&mut app, None);
+        let t2 = add_window_with_terminal(&mut app, None);
+
+        let m0 = t0.read(&app, |view, _| view.model.clone());
+        let m1 = t1.read(&app, |view, _| view.model.clone());
+        let m2 = t2.read(&app, |view, _| view.model.clone());
+        let (v0, v1, v2) = (t0.clone(), t1.clone(), t2.clone());
+        let (v0b, v1b, v2b) = (t0.clone(), t1.clone(), t2.clone());
+
+        let pane_stack = app.update(move |ctx| {
+            let mgr0 = ctx.add_model(|_| {
+                let m: Box<dyn TerminalManager> = Box::new(TestTerminalManager {
+                    model: m0,
+                    _view: v0,
+                });
+                m
+            });
+            let mgr1 = ctx.add_model(|_| {
+                let m: Box<dyn TerminalManager> = Box::new(TestTerminalManager {
+                    model: m1,
+                    _view: v1,
+                });
+                m
+            });
+            let mgr2 = ctx.add_model(|_| {
+                let m: Box<dyn TerminalManager> = Box::new(TestTerminalManager {
+                    model: m2,
+                    _view: v2,
+                });
+                m
+            });
+            let pane_stack = ctx.add_model(|ctx| PaneStack::new(mgr0, v0b, ctx));
+            pane_stack.update(ctx, |stack, ctx| {
+                // One sibling tab, then a nav-stack push on top (like cloud mode).
+                stack.add_tab(mgr1, v1b, ctx);
+                stack.push(mgr2, v2b, ctx);
+            });
+            pane_stack
+        });
+
+        // The push is a nav-stack entry, not a tab: two tabs, a nav entry on
+        // top, and the pushed view is active.
+        pane_stack.read(&app, |stack, _| {
+            assert_eq!(stack.depth(), 3);
+            assert_eq!(stack.tab_count(), 2);
+            assert!(stack.has_nav_entries());
+            assert_eq!(stack.active_view().id(), t2.id());
+        });
+
+        // Popping the nav entry returns to the tabs with nothing pushed.
+        let _ = pane_stack.update(&mut app, |stack, ctx| stack.pop(ctx));
+        pane_stack.read(&app, |stack, _| {
+            assert_eq!(stack.depth(), 2);
+            assert_eq!(stack.tab_count(), 2);
+            assert!(!stack.has_nav_entries());
+        });
+    })
 }
